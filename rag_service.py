@@ -1,58 +1,8 @@
-"""Module 8 — Integration Task: RAG Service.
-
-Implement a complete RAG mini-service: retrieve top-k context from Weaviate,
-construct a context-injected prompt, call flan-t5-base, return the answer with
-the retrieved context, and evaluate end-to-end on a 30-question eval set.
-
-Methodology (canonical — autograder enforces; do not deviate):
-- Top-k: k=5. Hybrid retrieval with alpha=0.5.
-- Prompt template (exact, byte-for-byte):
-
-      Answer the question using only the context. If the context does not contain the answer, say "I don't know."
-
-      Context:
-      [1] {title_1}: {answer_text_1}
-      [2] {title_2}: {answer_text_2}
-      [3] {title_3}: {answer_text_3}
-      [4] {title_4}: {answer_text_4}
-      [5] {title_5}: {answer_text_5}
-
-      Question: {query}
-      Answer:
-
-  Each {answer_text_i} is the retrieved post's `answer_text` field truncated
-  to its first 80 whitespace-split tokens.
-
-- Generator: google/flan-t5-base, greedy decoding (num_beams=1, max_new_tokens=128),
-  loaded ONCE at module level (not per call).
-
-- Row-class definitions (in data/rag_eval.jsonl):
-    answerable: difficulty in {single_fact, single_doc_synthesis} — 25 rows
-    borderline: difficulty == "borderline" — 5 rows (supporting doc does NOT
-                contain the answer; correct behavior is to abstain)
-
-- answer_keyword_recall_main: over 25 answerable rows. For each row,
-    (# expected_answer_keywords matched in answer, case-insensitive WHOLE-WORD)
-    / (# total expected_answer_keywords).
-  Average across rows. **Expected canonical baseline ~ 0.00–0.10.**
-
-- borderline_abstain_rate: over 5 borderline rows. Correctly abstained iff
-    (a) lowercased answer contains any phrase in ABSTAIN_PHRASES, OR
-    (b) len(answer.strip()) <= 20 chars AND groundedness_score(answer, contexts) <= 0.2.
-
-- mean_groundedness_main / mean_groundedness_borderline: groundedness_score
-  averaged over the respective row classes.
-
-- groundedness_score: lowercase both sides; tokenize on whitespace + punctuation;
-  remove stopwords (the STOPWORDS constant below); compute
-    |answer_tokens ∩ context_tokens| / |answer_tokens|.
-  Empty answer -> 0.0. Score in [0, 1].
-"""
+"""Module 8 — Integration Task: RAG Service."""
 
 import json
 import os
 import re
-import string
 from typing import List
 
 import weaviate
@@ -61,9 +11,6 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from index_helpers import bm25_search, dense_search, hybrid_search  # noqa: F401
 
-# ---------------------------------------------------------------------------
-# Constants — DO NOT MODIFY (autograder depends on these values)
-# ---------------------------------------------------------------------------
 
 CLASS_NAME = "Post"
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
@@ -91,18 +38,11 @@ STOPWORDS = {
     "will", "with", "would", "you", "your",
 }
 
-# ---------------------------------------------------------------------------
-# Module-level model loading (loaded ONCE per process; do not reload per call)
-# ---------------------------------------------------------------------------
 
 _tokenizer = AutoTokenizer.from_pretrained(GENERATOR_MODEL)
 _model = AutoModelForSeq2SeqLM.from_pretrained(GENERATOR_MODEL)
 _embedder = SentenceTransformer(EMBEDDER_MODEL)
 
-# Weaviate client is created lazily so importing this module does not crash
-# when the Weaviate container is not yet running (mirrors the drill's
-# weaviate_ready contract — connection failures surface at call time, not
-# import time).
 _client: weaviate.Client | None = None
 
 
@@ -113,119 +53,226 @@ def _get_client() -> weaviate.Client:
     return _client
 
 
-# ---------------------------------------------------------------------------
-# Helpers (provided)
-# ---------------------------------------------------------------------------
-
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 def _tokenize_for_groundedness(text: str) -> set[str]:
-    """Lowercase + whitespace+punctuation tokenize + stopword removal."""
     tokens = _TOKEN_RE.findall(text.lower())
-    return {t for t in tokens if t and t not in STOPWORDS}
+    return {token for token in tokens if token and token not in STOPWORDS}
 
 
 def _whole_word_match(keyword: str, answer: str) -> bool:
-    """Case-insensitive whole-word match used by answer_keyword_recall_main."""
     pattern = r"\b" + re.escape(keyword) + r"\b"
     return re.search(pattern, answer, flags=re.IGNORECASE) is not None
 
 
-# ---------------------------------------------------------------------------
-# Functions to implement
-# ---------------------------------------------------------------------------
-
 def retrieve(query: str, k: int = 5) -> List[dict]:
-    """Retrieve top-k contexts using hybrid_search with alpha=0.5.
+    client = _get_client()
 
-    Return a list of dicts with at least: doc_id, title, answer_text.
+    doc_ids = hybrid_search(
+        client,
+        query,
+        k,
+        _embedder,
+        alpha=0.5,
+    )
 
-    Use hybrid_search (provided in index_helpers.py) to get the top-k doc_ids,
-    then resolve each doc_id back to its full record (title + answer_text)
-    using the Weaviate client. The generator needs the answer content; the
-    question portion is not used in the prompt context.
-    """
-    # TODO: call hybrid_search(_get_client(), query, k, _embedder, alpha=0.5) -> list[doc_id]
-    # TODO: resolve each doc_id to {"doc_id", "title", "answer_text"}
-    raise NotImplementedError("retrieve is not yet implemented")
+    results = []
+
+    for doc_id in doc_ids:
+        response = (
+            client.query
+            .get(CLASS_NAME, ["doc_id", "title", "answer_text"])
+            .with_where({
+                "path": ["doc_id"],
+                "operator": "Equal",
+                "valueText": doc_id,
+            })
+            .with_limit(1)
+            .do()
+        )
+
+        posts = response.get("data", {}).get("Get", {}).get(CLASS_NAME) or []
+
+        if posts:
+            post = posts[0]
+            results.append({
+                "doc_id": post.get("doc_id", ""),
+                "title": post.get("title", ""),
+                "answer_text": post.get("answer_text", ""),
+            })
+
+    return results
+
 
 
 def build_prompt(query: str, contexts: List[dict]) -> str:
-    """Build the canonical prompt (see module docstring for the EXACT template).
+    context_lines = []
 
-    Each context's answer_text MUST be truncated to its first 80 whitespace-
-    split tokens before insertion. Title and "[i]:" markers are kept.
+    for i, context in enumerate(contexts, start=1):
+        title = context.get("title", "")
+        answer_text = context.get("answer_text", "")
+        truncated_answer = " ".join(answer_text.split()[:80])
+        context_lines.append(f"[{i}] {title}: {truncated_answer}")
 
-    The autograder checks the template byte-for-byte; deviations fail
-    test_build_prompt_matches_required_template.
-    """
-    # TODO: truncate each contexts[i]["answer_text"] to 80 whitespace tokens
-    # TODO: assemble the exact template (see module docstring)
-    raise NotImplementedError("build_prompt is not yet implemented")
+    context_block = "\n".join(context_lines)
+
+    return (
+        "Answer the question using only the context. If the context does not contain the answer, say \"I don't know.\"\n\n"
+        "Context:\n"
+        f"{context_block}\n\n"
+        f"Question: {query}\n"
+        "Answer:"
+    )
 
 
 def generate(prompt: str) -> str:
-    """Call flan-t5-base with greedy decoding.
+    inputs = _tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    )
 
-    inputs = _tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-    outputs = _model.generate(**inputs, max_new_tokens=128, num_beams=1)
+    outputs = _model.generate(
+        **inputs,
+        max_new_tokens=128,
+        num_beams=1,
+    )
+
     return _tokenizer.decode(outputs[0], skip_special_tokens=True)
-    """
-    # TODO: tokenize, generate (greedy: num_beams=1, max_new_tokens=128), decode
-    raise NotImplementedError("generate is not yet implemented")
 
 
 def rag_pipeline(query: str, k: int = 5) -> dict:
-    """Compose retrieve -> build_prompt -> generate.
+    contexts = retrieve(query, k)
+    prompt = build_prompt(query, contexts)
+    answer = generate(prompt)
 
-    Return: {"query", "answer", "contexts", "prompt"}.
-    """
-    # TODO: contexts = retrieve(...); prompt = build_prompt(...); answer = generate(...)
-    # TODO: return the four-key dict
-    raise NotImplementedError("rag_pipeline is not yet implemented")
+    return {
+        "query": query,
+        "answer": answer,
+        "contexts": contexts,
+        "prompt": prompt,
+    }
 
 
 def groundedness_score(answer: str, contexts: List[dict]) -> float:
-    """Content-word overlap between answer and concatenated contexts[*].answer_text.
+    answer_tokens = [
+        token for token in _TOKEN_RE.findall(answer.lower())
+        if token and token not in STOPWORDS
+    ]
 
-    - Lowercase both sides.
-    - Tokenize on whitespace + punctuation (use _tokenize_for_groundedness).
-    - Remove stopwords (done by _tokenize_for_groundedness).
-    - |answer ∩ context| / |answer|.
-    - Empty answer -> 0.0.
-    """
-    # TODO: handle empty-answer edge case
-    # TODO: tokenize answer and concatenated contexts using _tokenize_for_groundedness
-    # TODO: return |answer ∩ context| / |answer|
-    raise NotImplementedError("groundedness_score is not yet implemented")
+    if not answer_tokens:
+        return 0.0
+
+    context_text = " ".join(
+        context.get("answer_text", "") for context in contexts
+    )
+
+    context_tokens = set(
+        token for token in _TOKEN_RE.findall(context_text.lower())
+        if token and token not in STOPWORDS
+    )
+
+    overlap_count = sum(
+        1 for token in answer_tokens if token in context_tokens
+    )
+
+    return overlap_count / len(answer_tokens)
 
 
 def evaluate_rag(eval_path: str) -> dict:
-    """Run the pipeline over the 30-pair eval set and produce the five-key dict.
+    with open(eval_path, "r", encoding="utf-8") as file:
+        rows = [json.loads(line) for line in file if line.strip()]
 
-    Each eval row in `data/rag_eval.jsonl` is a dict with keys:
-      - "question": str (the user query — not "query")
-      - "expected_answer_keywords": list[str]
-      - "supporting_doc_id": str
-      - "difficulty": one of "single_fact" | "single_doc_synthesis" | "borderline"
+    answerable_recalls = []
+    answerable_groundedness = []
+    borderline_abstentions = []
+    borderline_groundedness = []
+    per_question = []
 
-    Iterate eval pairs; partition rows by `difficulty`:
-      answerable (single_fact / single_doc_synthesis) -> 25 rows
-      borderline (difficulty == "borderline") -> 5 rows
+    for row_index, row in enumerate(rows):
+        question = row["question"]
+        difficulty = row["difficulty"]
+        expected_keywords = row.get("expected_answer_keywords", [])
 
-    Compute:
-      answer_keyword_recall_main   (answerable only; whole-word case-insensitive)
-      mean_groundedness_main       (answerable only)
-      borderline_abstain_rate      (borderline only; ABSTAIN_PHRASES OR short+low-grd)
-      mean_groundedness_borderline (borderline only)
-      per_question                 (one diagnostic dict per row)
+        result = rag_pipeline(question)
+        answer = result["answer"]
+        contexts = result["contexts"]
+        groundedness = groundedness_score(answer, contexts)
 
-    Return all five keys. The metric split is enforced by the autograder
-    (test_evaluate_rag_keys); folding all 30 rows into one recall metric
-    penalises correct abstention and is wrong here by design.
-    """
-    # TODO: load eval rows; partition by difficulty
-    # TODO: run rag_pipeline on each row; compute per-row metrics
-    # TODO: assemble the 5-key dict (4 aggregates + per_question list)
-    raise NotImplementedError("evaluate_rag is not yet implemented")
+        record = {
+            "row_index": row_index,
+            "difficulty": difficulty,
+            "question": question,
+            "answer": answer,
+            "groundedness": groundedness,
+        }
+
+        if difficulty in {"single_fact", "single_doc_synthesis"}:
+            matched_keywords = [
+                keyword
+                for keyword in expected_keywords
+                if _whole_word_match(keyword, answer)
+            ]
+
+            recall = (
+                len(matched_keywords) / len(expected_keywords)
+                if expected_keywords else 0.0
+            )
+
+            answerable_recalls.append(recall)
+            answerable_groundedness.append(groundedness)
+            record["matched_keywords"] = matched_keywords
+
+        elif difficulty == "borderline":
+            answer_lower = answer.lower()
+
+            phrase_abstained = any(
+                phrase in answer_lower for phrase in ABSTAIN_PHRASES
+            )
+
+            short_low_groundedness = (
+                len(answer.strip()) <= 20 and groundedness <= 0.2
+            )
+
+            abstained = phrase_abstained or short_low_groundedness
+
+            borderline_abstentions.append(1.0 if abstained else 0.0)
+            borderline_groundedness.append(groundedness)
+            record["abstained"] = abstained
+
+        per_question.append(record)
+
+    return {
+        "answer_keyword_recall_main": (
+            sum(answerable_recalls) / len(answerable_recalls)
+            if answerable_recalls else 0.0
+        ),
+        "borderline_abstain_rate": (
+            sum(borderline_abstentions) / len(borderline_abstentions)
+            if borderline_abstentions else 0.0
+        ),
+        "mean_groundedness_main": (
+            sum(answerable_groundedness) / len(answerable_groundedness)
+            if answerable_groundedness else 0.0
+        ),
+        "mean_groundedness_borderline": (
+            sum(borderline_groundedness) / len(borderline_groundedness)
+            if borderline_groundedness else 0.0
+        ),
+        "per_question": per_question,
+    }
+if __name__ == "__main__":
+    results = evaluate_rag("data/rag_eval.jsonl")
+
+    print("Keyword Recall:", results["answer_keyword_recall_main"])
+    print("Abstain Rate:", results["borderline_abstain_rate"])
+    print("Groundedness Main:", results["mean_groundedness_main"])
+    print("Groundedness Borderline:", results["mean_groundedness_borderline"])
+
+    for row in results["per_question"]:
+        print("=" * 50)
+        print("Question:", row["question"])
+        print("Answer:", row["answer"])
+        print("Groundedness:", row["groundedness"])

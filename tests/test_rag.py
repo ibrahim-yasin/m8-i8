@@ -1,35 +1,48 @@
-"""Learner-written tests for the RAG pipeline.
-
-Replace each `pytest.fail("Not implemented...")` body with a real test that
-uses `assert` statements. The autograder includes an AST meta-check
-(test_learner_tests_complete) that verifies (a) at least 3 test functions
-exist, (b) each has at least 1 ast.Assert node, and (c) no `pass` body and
-no `pytest.fail("Not implemented")` placeholder remain.
-
-Hint: import the functions you want to test from rag_service. The Weaviate
-service must be running locally (the autograder workflow brings it up; for
-local runs, `docker run` Weaviate first and `python ingest.py`).
-"""
+"""Learner-written tests for the RAG pipeline."""
 
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import pytest
+from rag_service import build_prompt, groundedness_score, retrieve
 
 
 def test_retrieve_returns_k_or_fewer():
-    """retrieve(query, k=N) should return at most N items, each a dict."""
-    pytest.fail("Not implemented — write your test here")
+    results = retrieve("git rebase", k=5)
+
+    assert isinstance(results, list)
+    assert len(results) <= 5
+
+    for item in results:
+        assert isinstance(item, dict)
+        assert "doc_id" in item
+        assert "title" in item
+        assert "answer_text" in item
 
 
 def test_build_prompt_includes_context():
-    """build_prompt(query, contexts) should include all context titles in the
-    rendered prompt and the literal string 'Question:' before the query."""
-    pytest.fail("Not implemented — write your test here")
+    contexts = [
+        {
+            "doc_id": "1",
+            "title": "Git Rebase",
+            "answer_text": "Rebase rewrites commit history.",
+        }
+    ]
+
+    prompt = build_prompt("What is rebase?", contexts)
+
+    assert "Answer the question using only the context." in prompt
+    assert "[1] Git Rebase: Rebase rewrites commit history." in prompt
+    assert "Question: What is rebase?" in prompt
+    assert prompt.endswith("Answer:")
 
 
 def test_groundedness_zero_for_unrelated_answer():
-    """groundedness_score(unrelated_answer, contexts) should be ~ 0.0."""
-    pytest.fail("Not implemented — write your test here")
+    contexts = [
+        {"answer_text": "the quick brown fox jumps over the lazy dog"}
+    ]
+
+    score = groundedness_score("xyzzy plugh quux", contexts)
+
+    assert score <= 0.1
